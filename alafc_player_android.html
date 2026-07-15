@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ALAFC Player</title>
+<style>
+  body { background:#111; color:#eee; font-family:system-ui,sans-serif; margin:0;
+         display:flex; flex-direction:column; align-items:center; padding:24px 16px; }
+  h1 { font-size:1.5rem; margin:8px 0 2px; }
+  .sub { color:#888; font-size:.8rem; margin-bottom:24px; }
+  .card { background:#1c1c1e; border-radius:16px; padding:20px; width:100%; max-width:420px;
+          box-sizing:border-box; display:flex; flex-direction:column; gap:14px; }
+  label.file { background:#2c2c2e; border:1px dashed #555; border-radius:12px; padding:18px;
+          text-align:center; cursor:pointer; }
+  input[type=file] { display:none; }
+  #status { font-size:.9rem; min-height:1.2em; color:#aaa; word-wrap:break-word; }
+  #status.ok { color:#4cd964; } #status.warn { color:#ffb340; } #status.err { color:#ff5f57; }
+  progress { width:100%; height:8px; }
+  button { font-size:1.4rem; padding:14px; border-radius:12px; border:none;
+           background:#0a84ff; color:#fff; }
+  button:disabled { background:#333; color:#777; }
+  #meta { font-size:.85rem; color:#9a9; }
+  footer { color:#555; font-size:.7rem; margin-top:28px; text-align:center; }
+</style>
+</head>
+<body>
+<h1>ALAFC Player</h1>
+<div class="sub">Axelrod Lossless Audio Format Codec &middot; v1.0</div>
+<div class="card">
+  <label class="file">&#128194; Избери .alafc файл
+    <input type="file" id="f" accept=".alafc">
+  </label>
+  <progress id="pg" value="0" max="100" hidden></progress>
+  <div id="status">Няма зареден файл</div>
+  <div id="meta"></div>
+  <button id="play" disabled>&#9654; Пусни</button>
+</div>
+<footer>Декодирането е lossless (MD5 проверка на всеки файл).<br>
+16-bit файлове; hi-res (24/32-bit) &mdash; на компютъра.</footer>
+<script>
+// ALAFC decoder in JavaScript (v1/v2/v3, 16-bit files)
+// Exact integer math within float64 safe range; mirrors alafc.py bit-for-bit.
+'use strict';
+
+const MAGIC = [0x41, 0x4C, 0x41, 0x46]; // 'ALAF'
+const SYNC0 = 0xA1, SYNC1 = 0xAF;
+const MAXORD = 32, ESC_Q = 40;
+
+function makeCRCTable() {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+}
+const CRC_T = makeCRCTable();
+function crc32(buf, start, len) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < len; i++) c = CRC_T[(c ^ buf[start + i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ---- MD5 (for the embedded lossless check) ----
+function md5(bytes) {
+  const S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+             5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+             4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+             6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  const n = bytes.length;
+  const padded = new Uint8Array(((n + 8) >> 6 << 6) + 64);
+  padded.set(bytes); padded[n] = 0x80;
+  const bitLen = n * 8;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 8, bitLen >>> 0, true);
+  dv.setUint32(padded.length - 4, Math.floor(bitLen / 4294967296), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const M = new Uint32Array(16);
+  const rl = (x, c) => ((x << c) | (x >>> (32 - c))) >>> 0;
+  for (let i = 0; i < padded.length; i += 64) {
+    for (let j = 0; j < 16; j++) M[j] = dv.getUint32(i + j * 4, true);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let j = 0; j < 64; j++) {
+      let F, g;
+      if (j < 16)      { F = (B & C) | (~B & D); g = j; }
+      else if (j < 32) { F = (D & B) | (~D & C); g = (5 * j + 1) % 16; }
+      else if (j < 48) { F = B ^ C ^ D;          g = (3 * j + 5) % 16; }
+      else             { F = C ^ (B | ~D);       g = (7 * j) % 16; }
+      F = (F + A + K[j] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + rl(F, S[j])) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  const out = new Uint8Array(16);
+  const odv = new DataView(out.buffer);
+  odv.setUint32(0, a0, true); odv.setUint32(4, b0, true);
+  odv.setUint32(8, c0, true); odv.setUint32(12, d0, true);
+  return out;
+}
+
+// ---- bit reader (exact: acc stays < 2^48) ----
+class BitReader {
+  constructor(d, pos = 0) { this.d = d; this.pos = pos; this.n = 0; this.acc = 0; }
+  read(nb) {
+    while (this.n < nb) { this.acc = this.acc * 256 + this.d[this.pos++]; this.n += 8; }
+    this.n -= nb;
+    const div = 2 ** this.n;
+    const v = Math.floor(this.acc / div);
+    this.acc -= v * div;
+    return v;
+  }
+  align() { this.n = 0; this.acc = 0; }
+}
+
+function readHeader(d) {
+  for (let i = 0; i < 4; i++) if (d[i] !== MAGIC[i]) throw new Error('Не е ALAFC файл');
+  const br = new BitReader(d, 4);
+  const ver = br.read(8);
+  if (ver < 1 || ver > 3) throw new Error('Непозната ALAFC версия ' + ver);
+  const useMS = br.read(8) === 1;
+  const ch = br.read(8), bits = br.read(8);
+  const sr = br.read(32);
+  const nfHi = br.read(32), nfLo = br.read(32);
+  const nf = nfHi * 4294967296 + nfLo;
+  const block = br.read(16), part = br.read(16);
+  const nst = br.read(8);
+  const stages = [];
+  for (let i = 0; i < nst; i++) stages.push([br.read(16), br.read(8)]);
+  let md5b = null;
+  if (ver >= 2) { md5b = new Uint8Array(16); for (let i = 0; i < 16; i++) md5b[i] = br.read(8); }
+  const segb = ver >= 3 ? br.read(16) : 0;
+  return { ver, useMS, ch, bits, sr, nf, block, part, stages, md5b, segb, hdrEnd: br.pos };
+}
+
+function riceDecode(br, n, part, kbits, escRaw, out, o0) {
+  let i = 0;
+  while (i < n) {
+    const k = br.read(kbits);
+    const kdiv = 2 ** k;
+    const pn = Math.min(part, n - i);
+    for (let j = 0; j < pn; j++) {
+      let q = 0;
+      while (q < ESC_Q) { if (br.read(1) === 0) break; q++; }
+      let u;
+      if (q < ESC_Q) u = q * kdiv + (k > 0 ? br.read(k) : 0);
+      else u = br.read(escRaw);
+      const h = Math.floor(u / 2);
+      out[o0 + i + j] = (u % 2 === 0) ? h : -(h + 1);
+    }
+    i += pn;
+  }
+}
+
+function readBlockParams(br, bn) {
+  const o = br.read(8), sh = br.read(8);
+  const q = new Float64Array(o);
+  for (let i = 0; i < o; i++) {
+    const v = br.read(16);
+    q[o - 1 - i] = v >= 32768 ? v - 65536 : v; // stored order-reversed for the dot
+  }
+  return { q, sh, o };
+}
+
+// exact floor((acc+half)/2^shift) - all values well inside 2^53 for 16-bit
+function shr(acc, shift) { return Math.floor(acc / 2 ** shift); }
+
+function reconstruct(r2, nsamp, blk, params, stages, out, o0) {
+  const S = stages.length;
+  const bufs = [], sgns = [], ws = [], ords = [], shs = [], halves = [];
+  for (const [o, sh] of stages) {
+    bufs.push(new Float64Array(2 * o));
+    sgns.push(new Int8Array(2 * o));
+    ws.push(new Float64Array(o));
+    ords.push(o); shs.push(sh); halves.push(sh > 0 ? 2 ** (sh - 1) : 0);
+  }
+  const xbuf = new Float64Array(2 * MAXORD);
+  let bi = -1, q = null, lo = 0, lsh = 0, lhalf = 0;
+  for (let i = 0; i < nsamp; i++) {
+    if (i % blk === 0) {
+      bi++;
+      q = params[bi].q; lo = params[bi].o; lsh = params[bi].sh;
+      lhalf = lsh > 0 ? 2 ** (lsh - 1) : 0;
+    }
+    let v = r2[i];
+    for (let s = S - 1; s >= 0; s--) {
+      const o = ords[s], buf = bufs[s], sgn = sgns[s], w = ws[s];
+      const wp = i % o;
+      let acc = 0;
+      for (let j = 0; j < o; j++) acc += w[j] * buf[wp + j];
+      const p = shr(acc + halves[s], shs[s]);
+      if (v > 0)      { for (let j = 0; j < o; j++) w[j] += sgn[wp + j]; }
+      else if (v < 0) { for (let j = 0; j < o; j++) w[j] -= sgn[wp + j]; }
+      v = v + p;
+      const sv = v > 0 ? 1 : (v < 0 ? -1 : 0);
+      buf[wp] = v; buf[wp + o] = v;
+      sgn[wp] = sv; sgn[wp + o] = sv;
+    }
+    const wp32 = i % MAXORD;
+    let acc = 0;
+    const base = wp32 + MAXORD - lo;
+    for (let j = 0; j < lo; j++) acc += q[j] * xbuf[base + j];
+    const xi = v + shr(acc + lhalf, lsh);
+    out[o0 + i] = xi;
+    xbuf[wp32] = xi; xbuf[wp32 + MAXORD] = xi;
+  }
+}
+
+async function decodeALAFC(d, progress) {
+  const H = readHeader(d);
+  if (H.bits !== 16)
+    throw new Error('Този файл е ' + H.bits + '-bit hi-res. Уеб плеърът поддържа 16-bit; ' +
+                    'hi-res файловете пусни на лаптопа (пълна точност там).');
+  const chans = [];
+  const damaged = [];
+  const yield_ = () => new Promise(r => setTimeout(r, 0));
+  let pos = H.hdrEnd;
+  const total = H.nf * H.ch;
+  let doneSamples = 0;
+
+  if (H.ver < 3) {
+    const kbits = 5, escRaw = 32;
+    const br = new BitReader(d, pos);
+    for (let ci = 0; ci < H.ch; ci++) {
+      const params = [];
+      const r2 = new Float64Array(H.nf);
+      for (let s = 0; s < H.nf; s += H.block) {
+        const bn = Math.min(H.block, H.nf - s);
+        params.push(readBlockParams(br, bn));
+        riceDecode(br, bn, H.part, kbits, escRaw, r2, s);
+      }
+      br.align();
+      const out = new Float64Array(H.nf);
+      const CH = 8 * H.block;
+      // v1/v2: state is continuous, reconstruct whole channel in one go (chunked UI-wise is not possible without state carry) - do it in one call but yield before
+      await yield_();
+      reconstruct(r2, H.nf, H.block, params, H.stages, out, 0);
+      doneSamples += H.nf;
+      if (progress) progress(doneSamples / total);
+      chans.push(out);
+    }
+  } else {
+    const segLen = H.block * H.segb;
+    for (let ci = 0; ci < H.ch; ci++) {
+      const out = new Float64Array(H.nf); // zeros = muted default
+      for (let s0 = 0; s0 < H.nf; s0 += segLen) {
+        const nsamp = Math.min(segLen, H.nf - s0);
+        let ok = false;
+        if (pos + 10 <= d.length && d[pos] === SYNC0 && d[pos + 1] === SYNC1) {
+          const plen = (d[pos+2]*16777216 + d[pos+3]*65536 + d[pos+4]*256 + d[pos+5]);
+          const crc = ((d[pos+6]*16777216 + d[pos+7]*65536 + d[pos+8]*256 + d[pos+9])) >>> 0;
+          const pstart = pos + 10;
+          if (pstart + plen <= d.length) {
+            if (crc32(d, pstart, plen) === crc) {
+              try {
+                const br = new BitReader(d, pstart);
+                const params = [];
+                const r2 = new Float64Array(nsamp);
+                for (let s = 0; s < nsamp; s += H.block) {
+                  const bn = Math.min(H.block, nsamp - s);
+                  params.push(readBlockParams(br, bn));
+                  riceDecode(br, bn, H.part, 6, 40, r2, s);
+                }
+                reconstruct(r2, nsamp, H.block, params, H.stages, out, s0);
+                ok = true;
+              } catch (e) { ok = false; }
+            }
+            pos = pstart + plen;
+          } else pos = d.length;
+        } else {
+          let nxt = -1;
+          for (let p = pos + 1; p + 1 < d.length; p++)
+            if (d[p] === SYNC0 && d[p + 1] === SYNC1) { nxt = p; break; }
+          pos = nxt >= 0 ? nxt : d.length;
+        }
+        if (!ok) damaged.push([ci, s0 / H.sr]);
+        doneSamples += nsamp;
+        if (progress) progress(doneSamples / total);
+        await yield_();
+      }
+      chans.push(out);
+    }
+  }
+
+  // stereo inverse + interleave + int16
+  const nf = H.nf, ch = H.ch;
+  const inter = new Int16Array(nf * ch);
+  if (ch === 2) {
+    const A = chans[0], B = chans[1];
+    for (let i = 0; i < nf; i++) {
+      let Lv, Rv;
+      if (H.useMS) {
+        const mid = A[i], side = B[i];
+        const par = ((side % 2) + 2) % 2;
+        Lv = mid + Math.floor((side + par) / 2);
+        Rv = Lv - side;
+      } else { Lv = A[i]; Rv = B[i]; }
+      inter[2 * i] = Lv; inter[2 * i + 1] = Rv;
+    }
+  } else {
+    for (let i = 0; i < nf; i++) inter[i] = chans[0][i];
+  }
+
+  let verified = null;
+  if (H.md5b && damaged.length === 0) {
+    const pcmBytes = new Uint8Array(inter.buffer, 0, inter.length * 2);
+    const got = md5(pcmBytes);
+    verified = true;
+    for (let i = 0; i < 16; i++) if (got[i] !== H.md5b[i]) { verified = false; break; }
+  }
+  return { pcm: inter, ch, sr: H.sr, bits: H.bits, nf, ver: H.ver, verified, damaged };
+}
+
+
+
+
+let track = null, ctx = null, src = null, playing = false;
+const $ = id => document.getElementById(id);
+
+$('f').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  stop_();
+  $('play').disabled = true; $('meta').textContent = '';
+  $('status').className = ''; $('status').textContent = 'Декодиране... (при песен трае малко)';
+  $('pg').hidden = false; $('pg').value = 0;
+  try {
+    const d = new Uint8Array(await file.arrayBuffer());
+    track = await decodeALAFC(d, p => { $('pg').value = Math.round(p * 100); });
+    $('pg').hidden = true;
+    const dur = track.nf / track.sr;
+    $('meta').textContent = track.sr + ' Hz / ' + track.bits + '-bit / ' + track.ch + 'ch / '
+      + Math.floor(dur/60) + ':' + String(Math.floor(dur%60)).padStart(2,'0');
+    if (track.damaged.length) {
+      $('status').className = 'warn';
+      $('status').textContent = 'RECOVERED: ' + track.damaged.length +
+        ' повреден сегмент заглушен (около ' + track.damaged.map(x=>x[1].toFixed(1)+'s').join(', ') + ')';
+    } else if (track.verified === true) {
+      $('status').className = 'ok';
+      $('status').textContent = '✓ verified lossless (MD5 OK)';
+    } else if (track.verified === false) {
+      $('status').className = 'err';
+      $('status').textContent = 'MD5 не съвпада — файлът е повреден';
+      track = null; return;
+    } else {
+      $('status').className = 'ok';
+      $('status').textContent = 'Декодиран (стар формат без checksum)';
+    }
+    $('play').disabled = false;
+  } catch (err) {
+    $('pg').hidden = true;
+    $('status').className = 'err';
+    $('status').textContent = err.message;
+  }
+});
+
+function stop_() {
+  if (src) { try { src.stop(); } catch(e){} src = null; }
+  playing = false;
+  $('play').innerHTML = '&#9654; Пусни';
+}
+
+$('play').addEventListener('click', () => {
+  if (playing) { stop_(); return; }
+  if (!track) return;
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+  const buf = ctx.createBuffer(track.ch, track.nf, track.sr);
+  for (let c = 0; c < track.ch; c++) {
+    const chd = buf.getChannelData(c);
+    for (let i = 0; i < track.nf; i++) chd[i] = track.pcm[i * track.ch + c] / 32768;
+  }
+  src = ctx.createBufferSource();
+  src.buffer = buf; src.connect(ctx.destination);
+  src.onended = stop_;
+  src.start();
+  playing = true;
+  $('play').innerHTML = '&#9209; Стоп';
+});
+</script>
+</body>
+</html>
