@@ -121,7 +121,7 @@ function readHeader(d) {
   for (let i = 0; i < 4; i++) if (d[i] !== MAGIC[i]) throw new Error('Не е ALAFC файл');
   const br = new BitReader(d, 4);
   const ver = br.read(8);
-  if (ver < 1 || ver > 4) throw new Error('Непозната ALAFC версия ' + ver);
+  if (ver < 1 || ver > 5) throw new Error('Непозната ALAFC версия ' + ver);
   const stereoFlag = br.read(8);
   const useMS = stereoFlag === 1;
   const ch = br.read(8), bits = br.read(8);
@@ -304,12 +304,18 @@ async function decodeALAFC(d, progress) {
         const segIdx = Math.floor(i / segLen);
         const mode = H.segModes[segIdx];
         let Lv, Rv;
-        if (mode === 1) {
+        if (mode === 0) {                 // LR: A=L, B=R
+          Lv = A[i]; Rv = B[i];
+        } else if (mode === 2) {          // LS: A=L, B=side -> R = L - side
+          Lv = A[i]; Rv = A[i] - B[i];
+        } else if (mode === 3) {          // SR: A=side, B=R -> L = R + side
+          Rv = B[i]; Lv = B[i] + A[i];
+        } else {                          // MS (mode 1): A=mid, B=side
           const mid = A[i], side = B[i];
           const par = ((side % 2) + 2) % 2;
           Lv = mid + Math.floor((side + par) / 2);
           Rv = Lv - side;
-        } else { Lv = A[i]; Rv = B[i]; }
+        }
         inter[2 * i] = Lv; inter[2 * i + 1] = Rv;
       }
     } else {

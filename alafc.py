@@ -30,7 +30,7 @@ except Exception:
         return wrap
 
 MAGIC = b'ALAF'
-VER = 4
+VER = 5
 PART = 128
 PREC = 15
 MAXORD = 32
@@ -598,28 +598,38 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
     seg_len = blk * SEG_BLOCKS
     md5 = hashlib.md5(raw).digest()
 
+    # stereo mode per segment (FLAC-style 4-way): 0=LR 1=MS 2=LS 3=SR.
+    # 0 and 1 keep the exact meaning v4 used, so v4 files stay correct
+    # without any version check. LS/SR store one raw channel + the exact
+    # difference channel (no rounding needed to invert); MS needs the
+    # parity trick in from_ms().
+    SLOT0_SRC = ('L', 'M', 'L', 'S')
+    SLOT1_SRC = ('R', 'S', 'S', 'R')
+
     if ch == 2:
         L, R = pcm[0::2], pcm[1::2]
         M, S = to_ms(L, R)
+        srcmap = {'L': L, 'R': R, 'M': M, 'S': S}
         n = len(L)
         seg_bounds = list(range(0, n, seg_len))
         seg_modes = []
         for s0 in seg_bounds:
             e = min(s0 + seg_len, n)
-            lr_cost = _stereo_probe(L[s0:e], blk) + _stereo_probe(R[s0:e], blk)
-            ms_cost = _stereo_probe(M[s0:e], blk) + _stereo_probe(S[s0:e], blk)
-            seg_modes.append(1 if ms_cost < lr_cost else 0)
-        slot_pairs = [(M, L), (S, R)]
+            cL = _stereo_probe(L[s0:e], blk)
+            cR = _stereo_probe(R[s0:e], blk)
+            cM = _stereo_probe(M[s0:e], blk)
+            cS = _stereo_probe(S[s0:e], blk)
+            costs = (cL + cR, cM + cS, cL + cS, cS + cR)   # LR, MS, LS, SR
+            seg_modes.append(min(range(4), key=lambda k: costs[k]))
     else:
         n = len(pcm)
         seg_bounds = list(range(0, n, seg_len))
         seg_modes = None
-        slot_pairs = [(pcm, pcm)]
 
     bw = BitWriter()
     for b in MAGIC: bw.write(b, 8)
     bw.write(VER, 8)
-    bw.write(2 if ch == 2 else 0, 8)   # stereo-mode field: 2 = per-segment table follows (v4)
+    bw.write(2 if ch == 2 else 0, 8)   # stereo-mode field: 2 = per-segment table follows (v4+)
     bw.write(ch, 8); bw.write(bits, 8)
     bw.write(sr, 32); bw.write(nf, 64)
     bw.write(blk, 16); bw.write(PART, 16)
@@ -633,13 +643,32 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
         for m in seg_modes:
             bw.write(m, 8)
 
-    ms_count = sum(seg_modes) if seg_modes else 0
-    for slot, (src_true, src_false) in enumerate(slot_pairs):
+    if ch == 2:
+        mode_counts = [seg_modes.count(k) for k in range(4)]
+        for slot, slot_names in enumerate((SLOT0_SRC, SLOT1_SRC)):
+            m1 = m2 = cnt = 0.0
+            for i, s0 in enumerate(seg_bounds):
+                e = min(s0 + seg_len, n)
+                src = srcmap[slot_names[seg_modes[i]]]
+                xseg = src[s0:e]
+                payload, a1, a2 = _encode_segment_payload(xseg, blk)
+                m1 += a1; m2 += a2; cnt += 1
+                bw.align()
+                bw.write(SYNC0, 8); bw.write(SYNC1, 8)
+                bw.write(len(payload), 32)
+                bw.write(zlib.crc32(payload) & 0xFFFFFFFF, 32)
+                bw.write_bytes(payload)
+            if verbose and cnt:
+                print(f'  ch{slot}: mean|res| {m1/cnt:.1f} -> {m2/cnt:.1f}  ({int(cnt)} segments)')
+        if verbose:
+            tot = len(seg_modes)
+            print(f'  stereo: LR={mode_counts[0]} MS={mode_counts[1]} '
+                  f'LS={mode_counts[2]} SR={mode_counts[3]}  (of {tot} segments)')
+    else:
         m1 = m2 = cnt = 0.0
-        for i, s0 in enumerate(seg_bounds):
+        for s0 in seg_bounds:
             e = min(s0 + seg_len, n)
-            src = src_true if (seg_modes is None or seg_modes[i]) else src_false
-            xseg = src[s0:e]
+            xseg = pcm[s0:e]
             payload, a1, a2 = _encode_segment_payload(xseg, blk)
             m1 += a1; m2 += a2; cnt += 1
             bw.align()
@@ -648,10 +677,7 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
             bw.write(zlib.crc32(payload) & 0xFFFFFFFF, 32)
             bw.write_bytes(payload)
         if verbose and cnt:
-            print(f'  ch{slot}: mean|res| {m1/cnt:.1f} -> {m2/cnt:.1f}  ({int(cnt)} segments)')
-    if verbose and seg_modes:
-        print(f'  stereo: {ms_count}/{len(seg_modes)} segments used mid/side, '
-              f'{len(seg_modes)-ms_count} used L/R')
+            print(f'  ch0: mean|res| {m1/cnt:.1f} -> {m2/cnt:.1f}  ({int(cnt)} segments)')
 
     data = bw.bytes()
     with open(alafc_out, 'wb') as f:
@@ -671,7 +697,7 @@ def _read_header(br):
     if bytes(br.read(8) for _ in range(4)) != MAGIC:
         raise ValueError('not an ALAFC file')
     ver = br.read(8)
-    if ver not in (1, 2, 3, 4): raise ValueError(f'unsupported ALAFC version {ver}')
+    if ver not in (1, 2, 3, 4, 5): raise ValueError(f'unsupported ALAFC version {ver}')
     stereo_flag = br.read(8)
     use_ms = stereo_flag == 1
     ch = br.read(8); bits = br.read(8)
@@ -768,10 +794,16 @@ def _parse_and_reconstruct(data, verbose=True):
             L = np.empty(nf, dtype=np.int64); R = np.empty(nf, dtype=np.int64)
             for i, s0 in enumerate(range(0, nf, seg_len)):
                 e = min(s0 + seg_len, nf)
-                if seg_modes[i]:
-                    l, r = from_ms(chans[0][s0:e], chans[1][s0:e])
-                else:
-                    l, r = chans[0][s0:e], chans[1][s0:e]
+                a, b = chans[0][s0:e], chans[1][s0:e]
+                mode = seg_modes[i]
+                if mode == 0:                    # LR: a=L, b=R
+                    l, r = a, b
+                elif mode == 2:                  # LS: a=L, b=side -> R = L - side
+                    l, r = a, a - b
+                elif mode == 3:                  # SR: a=side, b=R -> L = R + side
+                    l, r = b + a, b
+                else:                             # MS (mode 1 - same meaning as v4): a=mid, b=side
+                    l, r = from_ms(a, b)
                 L[s0:e] = l; R[s0:e] = r
         else:
             L, R = from_ms(chans[0], chans[1]) if use_ms else (chans[0], chans[1])
@@ -824,8 +856,10 @@ def info(path):
     rawsz = nf * ch * (bits // 8)
     extra = f' / segments of {block*segb} samples (CRC32)' if ver >= 3 else ''
     if seg_modes is not None:
-        ms_n = sum(seg_modes)
-        stereo_txt = f'per-segment ({ms_n}/{len(seg_modes)} mid-side)'
+        names = ['LR', 'MS', 'LS', 'SR']
+        counts = [seg_modes.count(k) for k in range(4)]
+        parts = ' '.join(f'{names[k]}={counts[k]}' for k in range(4) if counts[k])
+        stereo_txt = f'per-segment ({parts})'
     else:
         stereo_txt = 'mid-side' if use_ms else 'L-R'
     print(f'ALAFC v{ver}: {sr} Hz / {bits}-bit / {ch}ch / {dur:.1f}s / '

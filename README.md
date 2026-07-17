@@ -27,10 +27,11 @@ embedded MD5 of the original PCM.
   checked on every decode
 - 16 / 24 / 32-bit integer PCM, mono/stereo, any sample rate
   (tested to 384 kHz, format allows more)
-- **Per-segment adaptive stereo** (v4): L/R vs mid/side is chosen
-  independently for each ~6s segment instead of once for the whole file,
-  so a track whose stereo width changes over time (mono intro, wide
-  chorus) isn't stuck with one average choice
+- **Per-segment adaptive stereo** (v5): each ~6s segment picks whichever
+  of 4 FLAC-style modes costs least - L/R, mid/side, L/side, or side/R -
+  instead of one whole-file average. L/side and side/R (new in v5) win
+  when the two channels have noticeably different loudness; v4's simpler
+  L/R-vs-mid/side choice is still there as a subset
 - **Self-healing files**: audio is stored in ~6 s segments, each with a
   sync marker and CRC32. Corruption mutes only the damaged segment and
   reports its exact position; everything else stays bit-exact

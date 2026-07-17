@@ -1,4 +1,4 @@
-# ALAFC Format Specification (v4, codec 1.1.0)
+# ALAFC Format Specification (v5, codec 1.2.0)
 
 All multi-byte header fields are big-endian. The bitstream is MSB-first.
 All arithmetic is integer-exact; ">> s" means arithmetic shift right
@@ -14,9 +14,9 @@ channel 0, then channel 1.
 ## Header
 
     magic       4 B   "ALAF"
-    version     1 B   4 (decoders must also accept 1, 2, 3)
+    version     1 B   5 (decoders must also accept 1, 2, 3, 4)
     stereo_flag 1 B   0 = L/R, 1 = mid/side (whole file, v1-v3 meaning),
-                      2 = per-segment table follows (v4, stereo files)
+                      2 = per-segment table follows (v4+, stereo files)
     channels    1 B   1 or 2
     bits        1 B   16, 24 or 32
     samplerate  4 B
@@ -27,23 +27,39 @@ channel 0, then channel 1.
     per stage:  2 B order, 1 B shift        (1.0 default: 512/13, 128/12, 32/10, 8/8)
     md5         16 B  MD5 of the raw source PCM bytes (v2+)
     seg_blocks  2 B   blocks per segment (64) (v3+)
-    n_segs      2 B   segment count (v4, stereo only, i.e. stereo_flag==2)
-    seg_modes   1 B * n_segs   0=L/R, 1=mid/side for that segment (v4, stereo only)
+    n_segs      2 B   segment count (v4+, stereo only, i.e. stereo_flag==2)
+    seg_modes   1 B * n_segs   per-segment stereo mode (v4+, stereo only) -
+                      0=L/R, 1=mid/side, 2=L/side, 3=side/R (2 and 3 are v5+;
+                      a v4 file only ever contains 0 or 1, and decodes
+                      identically under this same table, no version check
+                      needed)
 
 ## Stereo decorrelation
 
-mid = (L+R)>>1, side = L-R. Inverse: L = mid + ((side + (side&1)) >> 1),
-R = L - side.
+mid = (L+R)>>1, side = L-R. Four ways to store a channel pair, chosen per
+segment by whichever has the lowest exact LPC-residual cost estimate
+(same idea FLAC's reference encoder uses per block, extended here to
+whole segments):
 
-- v1-v3: one choice for the whole file, by exact LPC-residual cost probe
-  on a middle slice.
-- v4: one choice per segment (see Segments below), by the same exact cost
-  probe applied to that segment's samples only. This lets the encoder
-  track content whose stereo width changes over time - e.g. a mono intro
-  versus a wide, hard-panned chorus - rather than committing to a single
-  whole-file average. Segment i's channel-0 stream holds mid[i] if
-  seg_modes[i]==1 else L[i]; channel-1 holds side[i] or R[i] the same way.
-  A decoder combines them back to L/R per segment using seg_modes[i].
+    mode 0  L/R    channel 0 = L,    channel 1 = R      (no transform)
+    mode 1  mid/side  channel 0 = mid,  channel 1 = side
+                    inverse: L = mid + ((side + (side&1)) >> 1), R = L - side
+    mode 2  L/side channel 0 = L,    channel 1 = side
+                    inverse: R = L - side                (exact, no rounding)
+    mode 3  side/R channel 0 = side, channel 1 = R
+                    inverse: L = R + side                (exact, no rounding)
+
+Modes 2 and 3 skip mid/side's rounding entirely since one raw channel is
+kept as-is; they tend to win when the two channels have noticeably
+different loudness (e.g. an instrument panned mostly to one side) - a
+case plain mid/side does not handle as well. Mode selection is per
+segment (see below), independent for each ~6 s chunk, so a track whose
+stereo character changes over time - or is simply asymmetric throughout -
+isn't stuck with one whole-file average.
+
+- v1-v3: one mode (0 or 1) chosen for the whole file.
+- v4: one of {0, 1} chosen per segment.
+- v5: one of {0, 1, 2, 3} chosen per segment.
 
 ## Segments (v3+)
 
@@ -95,5 +111,7 @@ For each block in the segment:
     v2  + embedded MD5
     v3  + segments (sync/length/CRC32), 32-bit PCM, 6-bit k, 40-bit escape
     v4  + per-segment adaptive stereo mode (was: one whole-file choice)
+    v5  + 2 more per-segment stereo modes (L/side, side/R), FLAC-style
+        4-way choice instead of 2-way; v4 files decode unchanged
 
 MIT License, (c) 2026 Axelrod.

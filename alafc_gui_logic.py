@@ -34,8 +34,10 @@ def track_info(path, frames, sr, ch, bits, status):
             pct = 100 * disk_size / raw_size if raw_size else 0
             kbps = (disk_size * 8) / dur / 1000 if dur else 0
             if seg_modes is not None:
-                ms_n = sum(seg_modes)
-                stereo_txt = f'ADAPTIVE ({ms_n}/{len(seg_modes)} MS)'
+                names = ['LR', 'MS', 'LS', 'SR']
+                counts = [seg_modes.count(k) for k in range(4)]
+                parts = '/'.join(f'{names[k]}{counts[k]}' for k in range(4) if counts[k])
+                stereo_txt = f'ADAPTIVE ({parts})'
             else:
                 stereo_txt = 'MID/SIDE' if use_ms else 'L / R'
             info.update(

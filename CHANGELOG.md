@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 - 2026-07-17
+
+- Codec format v5: per-segment stereo mode extended from 2 choices to
+  FLAC's 4-way scheme (L/R, mid/side, L/side, side/R), picked by exact
+  cost estimate per ~6s segment. L/side and side/R skip mid/side's
+  rounding entirely (one channel kept raw) and tend to win when the two
+  channels have noticeably different loudness - a case plain mid/side
+  doesn't handle as well. Measured +0.6% over the v4 2-way scheme on an
+  asymmetric-loudness test track, on top of v4's own gains; no change on
+  content where L/R or mid/side already do the job. v1-v4 files decode
+  unchanged - v4's mode values 0 and 1 keep the exact same meaning in v5.
+- Prompted directly by a follow-up Hydrogenaudio comment (Porcus)
+  explaining how the FLAC reference encoder makes this exact choice.
+
 ## 1.1.0 - 2026-07-17
 
 - Codec format v4: per-segment adaptive stereo mode. v1-v3 chose L/R vs
