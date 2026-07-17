@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-# ALAFC v3 - Axelrod Lossless Audio Format Codec
-# Version 1.0.0 - Copyright (c) 2026 Axelrod. MIT License (see LICENSE.txt)
+# ALAFC v4 - Axelrod Lossless Audio Format Codec
+# Version 1.1.0 - Copyright (c) 2026 Axelrod. MIT License (see LICENSE.txt)
 #
+# v4: + per-segment adaptive stereo mode. v1-v3 chose L/R vs mid/side ONCE for
+#     the whole file; v4 picks whichever costs less independently for each
+#     ~6s segment, since a track's stereo width often changes over time (a
+#     mono intro vs a wide chorus, for example). v1/v2/v3 files still decode
+#     unchanged.
 # v3: 16/24/32-bit PCM, any sample rate (tested to 384 kHz, format allows more),
 #     self-healing segments: ~6 s chunks, each with sync marker + length + CRC32.
 #     A damaged file no longer dies - broken segments are muted, the rest plays.
@@ -25,7 +30,7 @@ except Exception:
         return wrap
 
 MAGIC = b'ALAF'
-VER = 3
+VER = 4
 PART = 128
 PREC = 15
 MAXORD = 32
@@ -592,23 +597,29 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
     blk = pick_block(sr)
     seg_len = blk * SEG_BLOCKS
     md5 = hashlib.md5(raw).digest()
+
     if ch == 2:
         L, R = pcm[0::2], pcm[1::2]
         M, S = to_ms(L, R)
-        plen = min(len(L), 2 * seg_len)          # bounded probe: ~12 s from the middle
-        p0 = max(0, (len(L) - plen) // 2)
-        sl = slice(p0, p0 + plen)
-        use_ms = (_stereo_probe(M[sl], blk) + _stereo_probe(S[sl], blk)) < \
-                 (_stereo_probe(L[sl], blk) + _stereo_probe(R[sl], blk))
-        chans = [M, S] if use_ms else [L, R]
+        n = len(L)
+        seg_bounds = list(range(0, n, seg_len))
+        seg_modes = []
+        for s0 in seg_bounds:
+            e = min(s0 + seg_len, n)
+            lr_cost = _stereo_probe(L[s0:e], blk) + _stereo_probe(R[s0:e], blk)
+            ms_cost = _stereo_probe(M[s0:e], blk) + _stereo_probe(S[s0:e], blk)
+            seg_modes.append(1 if ms_cost < lr_cost else 0)
+        slot_pairs = [(M, L), (S, R)]
     else:
-        use_ms = False
-        chans = [pcm]
+        n = len(pcm)
+        seg_bounds = list(range(0, n, seg_len))
+        seg_modes = None
+        slot_pairs = [(pcm, pcm)]
 
     bw = BitWriter()
     for b in MAGIC: bw.write(b, 8)
     bw.write(VER, 8)
-    bw.write(1 if use_ms else 0, 8)
+    bw.write(2 if ch == 2 else 0, 8)   # stereo-mode field: 2 = per-segment table follows (v4)
     bw.write(ch, 8); bw.write(bits, 8)
     bw.write(sr, 32); bw.write(nf, 64)
     bw.write(blk, 16); bw.write(PART, 16)
@@ -617,12 +628,18 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
         bw.write(o, 16); bw.write(s, 8)
     for b in md5: bw.write(b, 8)
     bw.write(SEG_BLOCKS, 16)
+    if ch == 2:
+        bw.write(len(seg_modes), 16)
+        for m in seg_modes:
+            bw.write(m, 8)
 
-    for ci, x in enumerate(chans):
-        n = len(x)
+    ms_count = sum(seg_modes) if seg_modes else 0
+    for slot, (src_true, src_false) in enumerate(slot_pairs):
         m1 = m2 = cnt = 0.0
-        for s0 in range(0, n, seg_len):
-            xseg = x[s0 : s0 + seg_len]
+        for i, s0 in enumerate(seg_bounds):
+            e = min(s0 + seg_len, n)
+            src = src_true if (seg_modes is None or seg_modes[i]) else src_false
+            xseg = src[s0:e]
             payload, a1, a2 = _encode_segment_payload(xseg, blk)
             m1 += a1; m2 += a2; cnt += 1
             bw.align()
@@ -631,7 +648,11 @@ def encode(wav_in, alafc_out, verbose=True, self_verify=True):
             bw.write(zlib.crc32(payload) & 0xFFFFFFFF, 32)
             bw.write_bytes(payload)
         if verbose and cnt:
-            print(f'  ch{ci}: mean|res| {m1/cnt:.1f} -> {m2/cnt:.1f}  ({int(cnt)} segments)')
+            print(f'  ch{slot}: mean|res| {m1/cnt:.1f} -> {m2/cnt:.1f}  ({int(cnt)} segments)')
+    if verbose and seg_modes:
+        print(f'  stereo: {ms_count}/{len(seg_modes)} segments used mid/side, '
+              f'{len(seg_modes)-ms_count} used L/R')
+
     data = bw.bytes()
     with open(alafc_out, 'wb') as f:
         f.write(data)
@@ -650,8 +671,9 @@ def _read_header(br):
     if bytes(br.read(8) for _ in range(4)) != MAGIC:
         raise ValueError('not an ALAFC file')
     ver = br.read(8)
-    if ver not in (1, 2, 3): raise ValueError(f'unsupported ALAFC version {ver}')
-    use_ms = br.read(8) == 1
+    if ver not in (1, 2, 3, 4): raise ValueError(f'unsupported ALAFC version {ver}')
+    stereo_flag = br.read(8)
+    use_ms = stereo_flag == 1
     ch = br.read(8); bits = br.read(8)
     sr = br.read(32); nf = br.read(64)
     block = br.read(16); part = br.read(16)
@@ -659,7 +681,11 @@ def _read_header(br):
     stages = [(br.read(16), br.read(8)) for _ in range(nst)]
     md5 = bytes(br.read(8) for _ in range(16)) if ver >= 2 else None
     segb = br.read(16) if ver >= 3 else 0
-    return ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb
+    seg_modes = None
+    if ver >= 4 and stereo_flag == 2:
+        nseg = br.read(16)
+        seg_modes = [br.read(8) for _ in range(nseg)]
+    return ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb, seg_modes
 
 def _parse_v12_channel(br, n, block):
     params = []; r2 = np.empty(n, dtype=np.int64)
@@ -695,7 +721,7 @@ def _find_sync(data, start):
 
 def _parse_and_reconstruct(data, verbose=True):
     br = BitReader(data)
-    ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb = _read_header(br)
+    ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb, seg_modes = _read_header(br)
     global PART; PART = part
     damaged = []
     chans = []
@@ -708,7 +734,7 @@ def _parse_and_reconstruct(data, verbose=True):
         seg_len = block * segb
         for ci in range(ch):
             out = np.zeros(nf, dtype=np.int64)
-            pos = br.pos  # header/segments are byte-aligned in v3
+            pos = br.pos  # header/segments are byte-aligned in v3+
             for s0 in range(0, nf, seg_len):
                 nsamp = min(seg_len, nf - s0)
                 ok_seg = False
@@ -737,7 +763,18 @@ def _parse_and_reconstruct(data, verbose=True):
             if verbose: print(f'  ch{ci}: {"OK" if not damaged else "recovered"}')
             chans.append(out)
     if ch == 2:
-        L, R = from_ms(chans[0], chans[1]) if use_ms else (chans[0], chans[1])
+        if seg_modes is not None:
+            seg_len = block * segb
+            L = np.empty(nf, dtype=np.int64); R = np.empty(nf, dtype=np.int64)
+            for i, s0 in enumerate(range(0, nf, seg_len)):
+                e = min(s0 + seg_len, nf)
+                if seg_modes[i]:
+                    l, r = from_ms(chans[0][s0:e], chans[1][s0:e])
+                else:
+                    l, r = chans[0][s0:e], chans[1][s0:e]
+                L[s0:e] = l; R[s0:e] = r
+        else:
+            L, R = from_ms(chans[0], chans[1]) if use_ms else (chans[0], chans[1])
         inter = np.empty(nf * 2, dtype=np.int64)
         inter[0::2] = L; inter[1::2] = R
     else:
@@ -779,15 +816,20 @@ def decode(alafc_in, wav_out, verbose=True):
         raise RuntimeError('MD5 mismatch - decoded audio does not match original')
 
 def info(path):
-    data = open(path, 'rb').read(4096)
+    data = open(path, 'rb').read(65536)  # generous enough for header + mode table
     br = BitReader(data)
-    ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb = _read_header(br)
+    ver, use_ms, ch, bits, sr, nf, block, part, stages, md5, segb, seg_modes = _read_header(br)
     size = os.path.getsize(path)
     dur = nf / sr
     rawsz = nf * ch * (bits // 8)
     extra = f' / segments of {block*segb} samples (CRC32)' if ver >= 3 else ''
+    if seg_modes is not None:
+        ms_n = sum(seg_modes)
+        stereo_txt = f'per-segment ({ms_n}/{len(seg_modes)} mid-side)'
+    else:
+        stereo_txt = 'mid-side' if use_ms else 'L-R'
     print(f'ALAFC v{ver}: {sr} Hz / {bits}-bit / {ch}ch / {dur:.1f}s / '
-          f'{"mid-side" if use_ms else "L-R"} / {size} B '
+          f'{stereo_txt} / {size} B '
           f'({100*size/rawsz:.1f}% of raw PCM){extra}')
 
 def pcm_md5(path):

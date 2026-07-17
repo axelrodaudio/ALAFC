@@ -121,8 +121,9 @@ function readHeader(d) {
   for (let i = 0; i < 4; i++) if (d[i] !== MAGIC[i]) throw new Error('Не е ALAFC файл');
   const br = new BitReader(d, 4);
   const ver = br.read(8);
-  if (ver < 1 || ver > 3) throw new Error('Непозната ALAFC версия ' + ver);
-  const useMS = br.read(8) === 1;
+  if (ver < 1 || ver > 4) throw new Error('Непозната ALAFC версия ' + ver);
+  const stereoFlag = br.read(8);
+  const useMS = stereoFlag === 1;
   const ch = br.read(8), bits = br.read(8);
   const sr = br.read(32);
   const nfHi = br.read(32), nfLo = br.read(32);
@@ -134,7 +135,13 @@ function readHeader(d) {
   let md5b = null;
   if (ver >= 2) { md5b = new Uint8Array(16); for (let i = 0; i < 16; i++) md5b[i] = br.read(8); }
   const segb = ver >= 3 ? br.read(16) : 0;
-  return { ver, useMS, ch, bits, sr, nf, block, part, stages, md5b, segb, hdrEnd: br.pos };
+  let segModes = null;
+  if (ver >= 4 && stereoFlag === 2) {
+    const nseg = br.read(16);
+    segModes = new Uint8Array(nseg);
+    for (let i = 0; i < nseg; i++) segModes[i] = br.read(8);
+  }
+  return { ver, useMS, ch, bits, sr, nf, block, part, stages, md5b, segb, segModes, hdrEnd: br.pos };
 }
 
 function riceDecode(br, n, part, kbits, escRaw, out, o0) {
@@ -291,15 +298,31 @@ async function decodeALAFC(d, progress) {
   const inter = new Int16Array(nf * ch);
   if (ch === 2) {
     const A = chans[0], B = chans[1];
-    for (let i = 0; i < nf; i++) {
-      let Lv, Rv;
-      if (H.useMS) {
-        const mid = A[i], side = B[i];
-        const par = ((side % 2) + 2) % 2;
-        Lv = mid + Math.floor((side + par) / 2);
-        Rv = Lv - side;
-      } else { Lv = A[i]; Rv = B[i]; }
-      inter[2 * i] = Lv; inter[2 * i + 1] = Rv;
+    if (H.segModes) {
+      const segLen = H.block * H.segb;
+      for (let i = 0; i < nf; i++) {
+        const segIdx = Math.floor(i / segLen);
+        const mode = H.segModes[segIdx];
+        let Lv, Rv;
+        if (mode === 1) {
+          const mid = A[i], side = B[i];
+          const par = ((side % 2) + 2) % 2;
+          Lv = mid + Math.floor((side + par) / 2);
+          Rv = Lv - side;
+        } else { Lv = A[i]; Rv = B[i]; }
+        inter[2 * i] = Lv; inter[2 * i + 1] = Rv;
+      }
+    } else {
+      for (let i = 0; i < nf; i++) {
+        let Lv, Rv;
+        if (H.useMS) {
+          const mid = A[i], side = B[i];
+          const par = ((side % 2) + 2) % 2;
+          Lv = mid + Math.floor((side + par) / 2);
+          Rv = Lv - side;
+        } else { Lv = A[i]; Rv = B[i]; }
+        inter[2 * i] = Lv; inter[2 * i + 1] = Rv;
+      }
     }
   } else {
     for (let i = 0; i < nf; i++) inter[i] = chans[0][i];

@@ -1,4 +1,4 @@
-# ALAFC Format Specification (v3, codec 1.0.0)
+# ALAFC Format Specification (v4, codec 1.1.0)
 
 All multi-byte header fields are big-endian. The bitstream is MSB-first.
 All arithmetic is integer-exact; ">> s" means arithmetic shift right
@@ -6,7 +6,7 @@ All arithmetic is integer-exact; ">> s" means arithmetic shift right
 
 ## File layout
 
-    [header] [channel 0 segments...] [channel 1 segments...]
+    [header] [stereo mode table, stereo files only, v4+] [channel 0 segments...] [channel 1 segments...]
 
 Channels are stored sequentially: for stereo, the full stream of
 channel 0, then channel 1.
@@ -14,8 +14,9 @@ channel 0, then channel 1.
 ## Header
 
     magic       4 B   "ALAF"
-    version     1 B   3 (decoders must also accept 1 and 2)
-    flags       1 B   bit0: 1 = mid/side, 0 = L/R
+    version     1 B   4 (decoders must also accept 1, 2, 3)
+    stereo_flag 1 B   0 = L/R, 1 = mid/side (whole file, v1-v3 meaning),
+                      2 = per-segment table follows (v4, stereo files)
     channels    1 B   1 or 2
     bits        1 B   16, 24 or 32
     samplerate  4 B
@@ -25,9 +26,26 @@ channel 0, then channel 1.
     n_stages    1 B   NLMS cascade depth
     per stage:  2 B order, 1 B shift        (1.0 default: 512/13, 128/12, 32/10, 8/8)
     md5         16 B  MD5 of the raw source PCM bytes (v2+)
-    seg_blocks  2 B   blocks per segment (64) (v3)
+    seg_blocks  2 B   blocks per segment (64) (v3+)
+    n_segs      2 B   segment count (v4, stereo only, i.e. stereo_flag==2)
+    seg_modes   1 B * n_segs   0=L/R, 1=mid/side for that segment (v4, stereo only)
 
-## Segments (v3)
+## Stereo decorrelation
+
+mid = (L+R)>>1, side = L-R. Inverse: L = mid + ((side + (side&1)) >> 1),
+R = L - side.
+
+- v1-v3: one choice for the whole file, by exact LPC-residual cost probe
+  on a middle slice.
+- v4: one choice per segment (see Segments below), by the same exact cost
+  probe applied to that segment's samples only. This lets the encoder
+  track content whose stereo width changes over time - e.g. a mono intro
+  versus a wide, hard-panned chorus - rather than committing to a single
+  whole-file average. Segment i's channel-0 stream holds mid[i] if
+  seg_modes[i]==1 else L[i]; channel-1 holds side[i] or R[i] the same way.
+  A decoder combines them back to L/R per segment using seg_modes[i].
+
+## Segments (v3+)
 
 Each channel is split into segments of `block * seg_blocks` samples.
 Predictor and filter state is RESET at every segment start, so each
@@ -41,7 +59,8 @@ segment decodes independently. Per segment, byte-aligned:
 A decoder that finds a bad CRC or lost sync outputs silence for that
 segment, reports its time position, and resynchronises at the next
 sync marker (the length field allows direct skipping, which also
-enables seeking).
+enables seeking). The seg_modes table itself is not individually
+CRC-protected (it is small and read once, ahead of the segment stream).
 
 ## Segment payload
 
@@ -54,9 +73,8 @@ For each block in the segment:
 
 ## Pipeline (encoder view)
 
-1. Stereo decorrelation (whole file): mid = (L+R)>>1, side = L-R.
-   Inverse: L = mid + ((side + (side&1)) >> 1), R = L - side.
-   Mode chosen by exact LPC-residual cost probe on a middle slice.
+1. Stereo decorrelation - see above (whole-file choice in v1-v3,
+   per-segment in v4).
 2. LPC per block: pred[n] = (sum(c_j * x[n-1-j]) + 2^(shift-1)) >> shift,
    history continuous within a segment, zeros at segment start.
    r1 = x - pred.
@@ -76,5 +94,6 @@ For each block in the segment:
     v1  no MD5
     v2  + embedded MD5
     v3  + segments (sync/length/CRC32), 32-bit PCM, 6-bit k, 40-bit escape
+    v4  + per-segment adaptive stereo mode (was: one whole-file choice)
 
 MIT License, (c) 2026 Axelrod.
