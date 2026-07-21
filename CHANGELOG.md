@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.0 (2026-07-21)
+
+Same v5 bitstream as 1.2.0 — files are fully interchangeable in both
+directions (verified: old 1.2.0 code decodes new files and vice versa,
+MD5 OK). The engine is rebuilt for speed and memory:
+
+- FFT autocorrelation replaces the O(n^2) lag scan in LPC analysis
+- LPC order search pruned by Levinson error; Rice k searched in a
+  window around the mean instead of scanning all 33 values
+- Segments are encoded/decoded on a thread pool (numba kernels now
+  run with nogil=True)
+- Encoder streams the WAV in ~6 s segments: constant RAM regardless
+  of file length (1.2.0 held the whole file in memory as int64)
+- Decoder fills tight int16/int32 buffers; decode-to-WAV streams
+  segment by segment
+- New speed profiles: --fast (pure LPC+Rice), --normal (light NLMS),
+  --max (full cascade, default — same compression as 1.2.0,
+  byte-identical output size on the demo corpus)
+
+Measured on the reference machine (numba, 8 threads):
+44.1 kHz / 16-bit: encode 21.6x realtime at max (1.2.0: 10.8x),
+26.4x at fast; decode 516x realtime for fast files, 47x for max.
+192 kHz / 24-bit: encode 6.3x at max (1.2.0: 5.5x), 9.1x at fast;
+decode 67.8x for fast files. Fast profile costs ~2-3 pp of ratio
+vs max. New: test_alafc_130.py (correctness suite) and
+bench_alafc_130.py (1.2.0 vs 1.3.0 benchmark + memory probe).
+
+
+
 ## 1.2.0 - 2026-07-17
 
 - Codec format v5: per-segment stereo mode extended from 2 choices to
